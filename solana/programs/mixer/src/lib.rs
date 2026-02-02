@@ -248,6 +248,22 @@ fn process_initialize(
         )?;
     }
 
+    // Create the mixer vault PDA (system-owned, 0 data) if it doesn't exist yet.
+    // This vault holds the fixed-denomination lamports and will be PDA-signed for withdrawals.
+    //
+    // Accounts are not passed explicitly for the vault; we derive and expect the client to pass it
+    // to Withdraw. For Initialize, we lazily create it here without storing it in state.
+    {
+        let (vault_pda, vault_bump) =
+            Pubkey::find_program_address(&[b"mixer_vault"], program_id);
+        // The vault account will be created by the client via a system transfer if it already exists.
+        // If it does not exist, we create it here in a rent-exempt manner.
+        // NOTE: We cannot access the vault AccountInfo here because it's not in the accounts list.
+        // So we only log its expected address for clients.
+        msg!("Expected mixer vault PDA: {}", vault_pda);
+        msg!("Mixer vault bump: {}", vault_bump);
+    }
+
     // Initialize state
     let mut data = state_account.try_borrow_mut_data()?;
     if data.len() < MixerState::LEN {
@@ -319,7 +335,7 @@ fn process_push_root(
 }
 
 fn process_withdraw(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     root: [u8; 32],
     nullifier_hash: [u8; 32],
@@ -327,7 +343,7 @@ fn process_withdraw(
     proof: Vec<u8>,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
-    let _relayer = next_account_info(account_info_iter)?;
+    let relayer = next_account_info(account_info_iter)?;
     let state_account = next_account_info(account_info_iter)?;
     let nullifier_account = next_account_info(account_info_iter)?;
     let vault_account = next_account_info(account_info_iter)?;
@@ -351,10 +367,23 @@ fn process_withdraw(
     // Mark nullifier as used by creating a small account; this is a simple pattern
     // that avoids building a custom bitmap.
     {
-        let payer = recipient_account; // any signer that funds this is acceptable
+        // Use the relayer (tx signer) to fund the marker account.
+        // (The recipient is not required to be a signer.)
+        let payer = relayer;
         if !payer.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
+
+        // Nullifier account must be the expected PDA so we can sign for it.
+        let (expected_nullifier, nullifier_bump) = Pubkey::find_program_address(
+            &[b"nullifier", &nullifier_hash],
+            program_id,
+        );
+        if nullifier_account.key != &expected_nullifier {
+            msg!("Invalid nullifier PDA");
+            return Err(ProgramError::InvalidArgument);
+        }
+
         let rent = Rent::get()?;
         let lamports = rent.minimum_balance(0);
         let create_ix = system_instruction::create_account(
@@ -364,13 +393,15 @@ fn process_withdraw(
             0,
             &system_program.key, // system-owned marker
         );
-        invoke(
+        let nullifier_seeds: &[&[u8]] = &[b"nullifier", &nullifier_hash, &[nullifier_bump]];
+        invoke_signed(
             &create_ix,
             &[
                 payer.clone(),
                 nullifier_account.clone(),
                 system_program.clone(),
             ],
+            &[nullifier_seeds],
         )?;
     }
 
@@ -393,14 +424,28 @@ fn process_withdraw(
     invoke(&verify_ix, &[]).map_err(|_| MixerError::VerificationFailed)?;
 
     // Transfer funds from vault to recipient
-    let transfer_ix = system_instruction::transfer(vault_account.key, recipient_account.key, state.denomination);
-    invoke(
+    // Vault must be the correct PDA so we can sign for it.
+    let (expected_vault, vault_bump) =
+        Pubkey::find_program_address(&[b"mixer_vault"], program_id);
+    if vault_account.key != &expected_vault {
+        msg!("Invalid vault PDA");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let transfer_ix = system_instruction::transfer(
+        vault_account.key,
+        recipient_account.key,
+        state.denomination,
+    );
+    let vault_seeds: &[&[u8]] = &[b"mixer_vault", &[vault_bump]];
+    invoke_signed(
         &transfer_ix,
         &[
             vault_account.clone(),
             recipient_account.clone(),
             system_program.clone(),
         ],
+        &[vault_seeds],
     )?;
 
     Ok(())

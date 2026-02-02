@@ -19,6 +19,7 @@
 import {
   address,
   createKeyPairSignerFromBytes,
+  generateKeyPairSigner,
   createSolanaRpc,
   createSolanaRpcSubscriptions,
   createTransactionMessage,
@@ -47,6 +48,7 @@ import path from "path";
 import { buildPoseidon, type Poseidon } from "circomlibjs";
 import { createPoseidonTree, initPoseidon } from "./merkle-tree.js";
 import crypto from "crypto";
+import { execSync } from "child_process";
 import { generateProof, createInstructionData, type MixerInputs } from "./proof-helper.js";
 import {
   getMixerAddresses,
@@ -108,11 +110,8 @@ async function loadKeypair(filePath: string): Promise<KeyPairSigner> {
 }
 
 async function createKeypair(): Promise<KeyPairSigner> {
-  // Generate a proper Ed25519 keypair
-  // Solana keypair format in bytes: [privateKey (32 bytes), publicKey (32 bytes)]
-  // We need to generate both properly
-  const { generateKeyPair } = await import("@solana/keys");
-  return await generateKeyPair();
+  // Use @solana/kit's signer generator (returns a KeyPairSigner with `.address`)
+  return await generateKeyPairSigner();
 }
 
 type PdaResult = readonly [Address<string>, ProgramDerivedAddressBump];
@@ -188,7 +187,9 @@ function hexToBigint(hex: string): bigint {
 
 // Helper function to generate random bigint (32 bytes)
 function randomBigint(): bigint {
-  const bytes = crypto.randomBytes(32);
+  // Keep values comfortably within BN254 field modulus by using 31 random bytes.
+  // (BN254 modulus is ~254 bits; 31 bytes = 248 bits.)
+  const bytes = crypto.randomBytes(31);
   return BigInt("0x" + bytes.toString("hex"));
 }
 
@@ -359,8 +360,13 @@ function generateProof(inputs: MixerInputs): ProofResult {
   const ccsPath = path.join(TARGET_DIR, "circuits.ccs");
   const pkPath = path.join(TARGET_DIR, "circuits.pk");
 
+  // Resolve sunspot binary. Prefer env override, then common local paths, then PATH.
+  const sunspotBin =
+    process.env.SUNSPOT_BIN ||
+    (fs.existsSync("/tmp/sunspot/go/sunspot") ? "/tmp/sunspot/go/sunspot" : "sunspot");
+
   execSync(
-    `sunspot prove ${acirPath} ${witnessPath} ${ccsPath} ${pkPath}`,
+    `${sunspotBin} prove ${acirPath} ${witnessPath} ${ccsPath} ${pkPath}`,
     {
       cwd: CIRCUIT_DIR,
       stdio: "pipe",
@@ -408,8 +414,13 @@ async function main() {
   // Check balances
   const payerBalance = await getBalance(ctx, payer.address);
   console.log(`Payer balance: ${formatLamports(payerBalance)}`);
-  if (payerBalance < lamports(2_000_000_000n)) {
-    console.log("  ⚠️  Low balance. Run: solana airdrop 2 <payer-address>");
+  // Tests need enough SOL to (1) fund state rent (first run), (2) deposit DENOMINATION,
+  // and (3) pay fees. Fail fast with a clear message instead of a generic simulation error.
+  const minRecommended = 2_000_000_000n; // 2 SOL
+  if (payerBalance < lamports(minRecommended)) {
+    throw new Error(
+      `Insufficient SOL for tests. Need ~2 SOL. Run: solana airdrop 2 ${payer.address} --url devnet`
+    );
   }
 
   // Get PDAs
@@ -465,11 +476,17 @@ async function main() {
     );
     assertIsTransactionWithBlockhashLifetime(signedInit);
     assertIsSendableTransaction(signedInit);
+    const initSigFromTx = getSignatureFromTransaction(signedInit);
     const initSig = await ctx.sendAndConfirm(signedInit, {
       commitment: "confirmed",
     });
     console.log(`  ✅ Mixer initialized`);
-    console.log(`  TX: https://explorer.solana.com/tx/${initSig}?cluster=devnet`);
+    console.log(
+      `  TX: https://explorer.solana.com/tx/${initSigFromTx}?cluster=devnet`
+    );
+    if (initSig !== initSigFromTx) {
+      console.log(`  ℹ️  sendAndConfirm returned different signature: ${initSig}`);
+    }
   } catch (err: any) {
     if (err.message?.includes("already in use") || err.message?.includes("AccountInUse")) {
       console.log("  ℹ️  Mixer already initialized");
@@ -512,8 +529,9 @@ async function main() {
   const pushRootIx = {
     programAddress: MIXER_PROGRAM_ID,
     accounts: [
-      { address: payer.address, role: "signer" },
-      { address: mixerState, role: "writable" },
+      // Account roles: 3 = signer + writable, 1 = writable, 0 = readonly
+      { address: payer.address, role: 3 }, // signer + writable
+      { address: mixerState, role: 1 }, // writable
     ],
     data: pushRootData,
   };
@@ -544,11 +562,19 @@ async function main() {
   );
   assertIsTransactionWithBlockhashLifetime(signedPushRoot);
   assertIsSendableTransaction(signedPushRoot);
-    const pushRootSig = await ctx.sendAndConfirm(signedPushRoot, {
+  const pushRootSigFromTx = getSignatureFromTransaction(signedPushRoot);
+  const pushRootSig = await ctx.sendAndConfirm(signedPushRoot, {
       commitment: "confirmed",
     });
   console.log(`  ✅ Deposit completed`);
-  console.log(`  TX: https://explorer.solana.com/tx/${pushRootSig}?cluster=devnet`);
+  console.log(
+    `  TX: https://explorer.solana.com/tx/${pushRootSigFromTx}?cluster=devnet`
+  );
+  if (pushRootSig !== pushRootSigFromTx) {
+    console.log(
+      `  ℹ️  sendAndConfirm returned different signature: ${pushRootSig}`
+    );
+  }
 
   // TEST 3: Withdraw
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -558,7 +584,8 @@ async function main() {
   // Get Merkle proof
   const merkleProof = tree.proof(0);
   // Calculate nullifier hash using circomlibjs
-  const nullifierHashResult = poseidon([nullifier]);
+  // Circuit hashes single element as poseidon_hash_2(nullifier, 0)
+  const nullifierHashResult = poseidon([nullifier, 0n]);
   const nullifierHashBigint = poseidon.F.toObject(nullifierHashResult) as bigint;
   const nullifierHash = bigintToHex(nullifierHashBigint);
   
@@ -624,13 +651,14 @@ async function main() {
   const withdrawIx = {
     programAddress: MIXER_PROGRAM_ID,
     accounts: [
-      { address: payer.address, role: "signer" },
-      { address: mixerState, role: "writable" },
-      { address: nullifierPda, role: "writable" },
-      { address: mixerVault, role: "writable" },
-      { address: recipient.address, role: "writable" },
-      { address: VERIFIER_PROGRAM_ID, role: "readonly" },
-      { address: SYSTEM_PROGRAM_ADDRESS, role: "readonly" },
+      // Account roles: 3 = signer + writable, 1 = writable, 0 = readonly
+      { address: payer.address, role: 3 }, // relayer/payer
+      { address: mixerState, role: 1 },
+      { address: nullifierPda, role: 1 },
+      { address: mixerVault, role: 1 },
+      { address: recipient.address, role: 1 },
+      { address: VERIFIER_PROGRAM_ID, role: 0 },
+      { address: SYSTEM_PROGRAM_ADDRESS, role: 0 },
     ],
     data: withdrawData,
   };
@@ -656,11 +684,27 @@ async function main() {
   );
   assertIsTransactionWithBlockhashLifetime(signedWithdraw);
   assertIsSendableTransaction(signedWithdraw);
-    const withdrawSig = await ctx.sendAndConfirm(signedWithdraw, {
+  const withdrawSigFromTx = getSignatureFromTransaction(signedWithdraw);
+  let withdrawSig: string;
+  try {
+    withdrawSig = await ctx.sendAndConfirm(signedWithdraw, {
       commitment: "confirmed",
     });
+  } catch (err: any) {
+    console.error("  ❌ Withdrawal simulation error:", err?.message || err);
+    // Dump structured error (often includes logs) for debugging.
+    console.error("  Full error:", err);
+    throw err;
+  }
   console.log(`  ✅ Withdrawal successful`);
-  console.log(`  TX: https://explorer.solana.com/tx/${withdrawSig}?cluster=devnet`);
+  console.log(
+    `  TX: https://explorer.solana.com/tx/${withdrawSigFromTx}?cluster=devnet`
+  );
+  if (withdrawSig !== withdrawSigFromTx) {
+    console.log(
+      `  ℹ️  sendAndConfirm returned different signature: ${withdrawSig}`
+    );
+  }
 
   const recipientBalanceAfter = await getBalance(ctx, recipient.address);
   console.log(`  Recipient balance: ${formatLamports(recipientBalanceBefore)} → ${formatLamports(recipientBalanceAfter)}`);
@@ -676,13 +720,13 @@ async function main() {
   const withdrawIx2 = {
     programAddress: MIXER_PROGRAM_ID,
     accounts: [
-      { address: payer.address, role: "signer" },
-      { address: mixerState, role: "writable" },
-      { address: nullifierPda, role: "writable" },
-      { address: mixerVault, role: "writable" },
-      { address: recipient.address, role: "writable" },
-      { address: VERIFIER_PROGRAM_ID, role: "readonly" },
-      { address: SYSTEM_PROGRAM_ADDRESS, role: "readonly" },
+      { address: payer.address, role: 3 },
+      { address: mixerState, role: 1 },
+      { address: nullifierPda, role: 1 },
+      { address: mixerVault, role: 1 },
+      { address: recipient.address, role: 1 },
+      { address: VERIFIER_PROGRAM_ID, role: 0 },
+      { address: SYSTEM_PROGRAM_ADDRESS, role: 0 },
     ],
     data: withdrawData,
   };
