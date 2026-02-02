@@ -11,7 +11,7 @@ The mixer consists of **two distinct Solana programs**:
    - Handles Groth16 proof verification
    - Called via Cross-Program Invocation (CPI) from the mixer program
 
-2. **Mixer Program** (to be deployed):
+2. **Mixer Program** (deployed at `267wWpf21MBLmyHD9j7ausHG6FR8gjMS3758zsMTTjBT` on devnet):
    - Application logic for the mixer
    - Maintains Merkle root history and nullifier tracking
    - Processes deposits (push roots) and withdrawals (verify proofs via CPI)
@@ -29,13 +29,14 @@ The mixer consists of **two distinct Solana programs**:
 
 ### 1. Build and Deploy Verifier Program
 
-The verifier program should already be deployed. If you need to redeploy:
+The verifier program is already deployed on devnet at the fixed program ID above. If you need to **redeploy/upgrade** it (same ID):
 
 ```bash
 cd circuits
 sunspot setup  # Generate proving/verifying keys
 sunspot deploy target/circuits.vk  # Generate and deploy verifier program
-solana program deploy target/circuits.so --url devnet
+solana program deploy target/circuits.so --url devnet \
+  --program-id target/circuits-keypair.json
 ```
 
 ### 2. Build Mixer Program
@@ -71,9 +72,20 @@ solana program deploy target/deploy/mixer.so \
 ```bash
 cd ts-client
 npm install
-export MIXER_PROGRAM_ID=<your-mixer-program-id>
 npm run test
 ```
+
+Notes:
+- **Funding**: tests perform a 1 SOL deposit + fees; ensure the payer has a few SOL.
+- **Sunspot binary**: if `sunspot` is not on your PATH, set `SUNSPOT_BIN` (or ensure `/tmp/sunspot/go/sunspot` exists).
+
+## Test Status (devnet)
+
+As of Feb 2026, the devnet integration test (`solana/ts-client/src/integration.test.ts`) passes:
+- **Initialize**: creates/initializes the mixer state PDA
+- **Deposit**: pushes a Merkle root and transfers 1 SOL to the vault PDA
+- **Withdraw**: generates a proof (`nargo execute` + `sunspot prove`) and withdraws 1 SOL to the recipient
+- **Double-withdraw**: correctly rejected (nullifier reuse)
 
 ## Project Structure
 
@@ -115,7 +127,7 @@ solana/
    - Checks the root is known
    - Checks the nullifier hasn't been used
    - CPI's into the verifier program to verify the proof
-   - Transfers funds from vault to recipient
+   - Transfers funds from the **vault PDA** to recipient using PDA signing
    - Marks nullifier as spent
 
 ## Troubleshooting
