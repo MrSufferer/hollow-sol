@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "programs/mixer",
+]
+resolver = "2"
+
+
+

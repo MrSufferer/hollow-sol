@@ -1,0 +1,16 @@
+[package]
+name = "mixer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mixer"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "3.0.0"
+solana-system-interface = { version = "3.0.0", features = ["bincode"] }
+thiserror = "1.0"
+
+
+
