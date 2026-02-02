@@ -476,11 +476,17 @@ async function main() {
     );
     assertIsTransactionWithBlockhashLifetime(signedInit);
     assertIsSendableTransaction(signedInit);
+    const initSigFromTx = getSignatureFromTransaction(signedInit);
     const initSig = await ctx.sendAndConfirm(signedInit, {
       commitment: "confirmed",
     });
     console.log(`  ✅ Mixer initialized`);
-    console.log(`  TX: https://explorer.solana.com/tx/${initSig}?cluster=devnet`);
+    console.log(
+      `  TX: https://explorer.solana.com/tx/${initSigFromTx}?cluster=devnet`
+    );
+    if (initSig !== initSigFromTx) {
+      console.log(`  ℹ️  sendAndConfirm returned different signature: ${initSig}`);
+    }
   } catch (err: any) {
     if (err.message?.includes("already in use") || err.message?.includes("AccountInUse")) {
       console.log("  ℹ️  Mixer already initialized");
@@ -556,11 +562,19 @@ async function main() {
   );
   assertIsTransactionWithBlockhashLifetime(signedPushRoot);
   assertIsSendableTransaction(signedPushRoot);
-    const pushRootSig = await ctx.sendAndConfirm(signedPushRoot, {
+  const pushRootSigFromTx = getSignatureFromTransaction(signedPushRoot);
+  const pushRootSig = await ctx.sendAndConfirm(signedPushRoot, {
       commitment: "confirmed",
     });
   console.log(`  ✅ Deposit completed`);
-  console.log(`  TX: https://explorer.solana.com/tx/${pushRootSig}?cluster=devnet`);
+  console.log(
+    `  TX: https://explorer.solana.com/tx/${pushRootSigFromTx}?cluster=devnet`
+  );
+  if (pushRootSig !== pushRootSigFromTx) {
+    console.log(
+      `  ℹ️  sendAndConfirm returned different signature: ${pushRootSig}`
+    );
+  }
 
   // TEST 3: Withdraw
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -670,6 +684,7 @@ async function main() {
   );
   assertIsTransactionWithBlockhashLifetime(signedWithdraw);
   assertIsSendableTransaction(signedWithdraw);
+  const withdrawSigFromTx = getSignatureFromTransaction(signedWithdraw);
   let withdrawSig: string;
   try {
     withdrawSig = await ctx.sendAndConfirm(signedWithdraw, {
@@ -682,7 +697,14 @@ async function main() {
     throw err;
   }
   console.log(`  ✅ Withdrawal successful`);
-  console.log(`  TX: https://explorer.solana.com/tx/${withdrawSig}?cluster=devnet`);
+  console.log(
+    `  TX: https://explorer.solana.com/tx/${withdrawSigFromTx}?cluster=devnet`
+  );
+  if (withdrawSig !== withdrawSigFromTx) {
+    console.log(
+      `  ℹ️  sendAndConfirm returned different signature: ${withdrawSig}`
+    );
+  }
 
   const recipientBalanceAfter = await getBalance(ctx, recipient.address);
   console.log(`  Recipient balance: ${formatLamports(recipientBalanceBefore)} → ${formatLamports(recipientBalanceAfter)}`);
